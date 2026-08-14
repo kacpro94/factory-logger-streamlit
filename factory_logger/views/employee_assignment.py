@@ -1,5 +1,5 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import json
 from datetime import datetime, date
 from databricks.sdk import WorkspaceClient
@@ -7,12 +7,11 @@ from databricks.sdk import WorkspaceClient
 # --- CONFIG DATA PLATFORM ---
 CATALOG = "data_warehouse_factory"
 SCHEMA_BRONZE = "bronze"
-SCHEMA_SILVER = "silver"
+SCHEMA_GOLD = "gold"
 VOLUME = "employee_assignments_raw"
-DATABRICKS_WAREHOUSE_ID = "f38fec74b09fdb89" 
+DATABRICKS_WAREHOUSE_ID = "f38fec74b09fdb89"
 
-st.title("👤 Edycja Przypisania Pracowników do Komórek")
-st.info("Zdefiniuj domyślną oraz zastępczą obsadę personalną dla poszczególnych linii i komórek produkcyjnych.")
+st.title("Line Staffing & Cell Assignments")
 
 # --- REUSABLE CLIENT ---
 @st.cache_resource
@@ -21,16 +20,19 @@ def get_databricks_client():
 
 w = get_databricks_client()
 
-# --- FUNKCJE POBIERAJĄCE DANE Z KESZEM (DLA OPTYMALIZACJI COMPUTE DBU) ---
+# --- 1. FETCH PRODUCTION STRUCTURE FROM GOLD ---
 @st.cache_data(ttl=300)
 def fetch_production_structure():
-    """Pobiera strukturę linii i komórek z warstwy Bronze."""
     try:
         sql_query = f"""
-            SELECT DISTINCT line_code, line_name, cell_code, cell_name 
-            FROM {CATALOG}.{SCHEMA_BRONZE}.bronze_production_structure
+            SELECT 
+                line_code, 
+                line_name, 
+                cell_code, 
+                cell_name 
+            FROM {CATALOG}.{SCHEMA_GOLD}.dim_production_cells
             WHERE line_code IS NOT NULL AND cell_code IS NOT NULL
-            ORDER BY line_code, cell_code
+            ORDER BY line_code ASC, cell_code ASC
         """
         response = w.statement_execution.execute_statement(
             warehouse_id=DATABRICKS_WAREHOUSE_ID,
@@ -39,19 +41,22 @@ def fetch_production_structure():
         if response.result and response.result.data_array:
             columns = [col.name for col in response.manifest.schema.columns]
             return pd.DataFrame(response.result.data_array, columns=columns)
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["line_code", "line_name", "cell_code", "cell_name"])
     except Exception as e:
-        st.error(f"⚠️ Nie udało się pobrać struktury produkcyjnej: {e}")
-        return pd.DataFrame()
+        st.error(f"Failed to load production structure: {e}")
+        return pd.DataFrame(columns=["line_code", "line_name", "cell_code", "cell_name"])
 
+# --- 2. FETCH ACTIVE EMPLOYEES FROM GOLD ---
 @st.cache_data(ttl=300)
-def fetch_employees_list():
-    """Pobiera listę pracowników z tabeli Silver wraz z employee_key."""
+def fetch_active_employees():
     try:
         sql_query = f"""
-            SELECT employee_key, employee_full_name, work_center
-            FROM {CATALOG}.{SCHEMA_SILVER}.silver_employees
-            WHERE employee_full_name IS NOT NULL AND (date_of_leaving IS NULL OR date_of_leaving > CURRENT_DATE())
+            SELECT 
+                employee_key, 
+                employee_full_name, 
+                work_center
+            FROM {CATALOG}.{SCHEMA_GOLD}.dim_employees
+            WHERE is_active = TRUE
             ORDER BY employee_full_name ASC
         """
         response = w.statement_execution.execute_statement(
@@ -59,139 +64,245 @@ def fetch_employees_list():
             statement=sql_query
         )
         if response.result and response.result.data_array:
-            return [
-                {
-                    "employee_key": int(row[0]), 
-                    "employee_full_name": row[1],
-                    "work_center": row[2]
-                }
-                for row in response.result.data_array
-            ]
-        return []
+            return pd.DataFrame(response.result.data_array, columns=[col.name for col in response.manifest.schema.columns])
+        return pd.DataFrame(columns=["employee_key", "employee_full_name", "work_center"])
     except Exception as e:
-        st.error(f"⚠️ Nie udało się pobrać listy pracowników: {e}")
-        return []
+        st.error(f"Failed to load employees: {e}")
+        return pd.DataFrame(columns=["employee_key", "employee_full_name", "work_center"])
 
-# Pobranie danych referencyjnych
+# --- 3. FETCH CURRENT ACTIVE ASSIGNMENTS FROM GOLD ---
+@st.cache_data(ttl=60)
+def fetch_current_assignments():
+    try:
+        sql_query = f"""
+            SELECT 
+                line_code,
+                cell_code,
+                shift,
+                default_employee_key,
+                default_employee_name,
+                backup_employee_key,
+                backup_employee_name,
+                valid_from
+            FROM {CATALOG}.{SCHEMA_GOLD}.dim_employee_assignments
+            WHERE is_current = TRUE
+        """
+        response = w.statement_execution.execute_statement(
+            warehouse_id=DATABRICKS_WAREHOUSE_ID,
+            statement=sql_query
+        )
+        if response.result and response.result.data_array:
+            columns = [col.name for col in response.manifest.schema.columns]
+            return pd.DataFrame(response.result.data_array, columns=columns)
+        return pd.DataFrame(columns=["line_code", "cell_code", "shift", "default_employee_name", "backup_employee_name"])
+    except Exception:
+        return pd.DataFrame(columns=["line_code", "cell_code", "shift", "default_employee_name", "backup_employee_name"])
+
 df_structure = fetch_production_structure()
-employees_options = fetch_employees_list()
+df_employees = fetch_active_employees()
+df_current_assignments = fetch_current_assignments()
 
-if df_structure.empty or not employees_options:
-    st.warning("⚠️ Brak wystarczających danych referencyjnych w bazy (sprawdź strukturę oraz listę pracowników).")
+# Prepare employee mapping dictionaries
+NONE_OPTION = "--- None ---"
+employee_name_to_key = dict(zip(df_employees["employee_full_name"], df_employees["employee_key"])) if not df_employees.empty else {}
+employee_options_list = [NONE_OPTION] + (df_employees["employee_full_name"].tolist() if not df_employees.empty else [])
 
-# --- KONTROLKI SELEKCJI STRUKTURY (POZA FORMULARZEM) ---
-st.subheader("1. Wybór Linii i Komórki Produkcyjnej")
+# --- LAYOUT: MASTER / DETAIL ---
+col_master, col_detail = st.columns([1, 2], gap="large")
 
-col_line, col_cell = st.columns(2)
-
-with col_line:
-    lines_list = df_structure['line_code'].unique().tolist() if not df_structure.empty else []
-    selected_line_code = st.selectbox(
-        "Linia Produkcyjna",
-        options=lines_list,
-        format_func=lambda code: f"{code} - {df_structure[df_structure['line_code']==code]['line_name'].iloc[0]}" if not df_structure.empty else code
-    )
-
-# Filtrowanie dostępnych komórek dla wybranej linii
-filtered_cells = []
-if selected_line_code and not df_structure.empty:
-    filtered_cells = df_structure[df_structure['line_code'] == selected_line_code]['cell_code'].unique().tolist()
-
-with col_cell:
-    selected_cell_code = st.selectbox(
-        "Komórka Produkcyjna (Swap Cell)",
-        options=filtered_cells,
-        format_func=lambda code: f"{code} - {df_structure[df_structure['cell_code']==code]['cell_name'].iloc[0]}" if not df_structure.empty else code
-    )
-
-st.divider()
-
-# --- FORMULARZ PRZYPISANIA OBSADY ---
-st.subheader("2. Obsada Personalna")
-
-# Opcja "Brak obsady" dla zapasowych pracowników
-EMPTY_EMPLOYEE = {"employee_key": None, "employee_full_name": "-- Brak --", "work_center": ""}
-employees_options_with_empty = [EMPTY_EMPLOYEE] + employees_options
-
-with st.form("assignment_form", clear_on_submit=False):
-    col_def, col_back = st.columns(2)
-
-    with col_def:
-        st.markdown("**Główny Pracownik (Default Employee)**")
-        default_emp = st.selectbox(
-            "Wybierz pracownika domyślnego",
-            options=employees_options,
-            format_func=lambda emp: f"[{emp['employee_key']}] {emp['employee_full_name']} ({emp['work_center']})"
+# ==========================================
+# 1. MASTER: PRODUCTION LINE SELECTION
+# ==========================================
+with col_master:
+    st.subheader("1. Line Selection")
+    
+    if not df_structure.empty and "line_code" in df_structure.columns:
+        lines_df = df_structure[["line_code", "line_name"]].drop_duplicates()
+        line_options = lines_df.to_dict(orient="records")
+        
+        selected_line_obj = st.selectbox(
+            "Select Line",
+            options=line_options,
+            format_func=lambda x: f"{x['line_code']} - {x['line_name']}"
         )
-
-    with col_back:
-        st.markdown("**Zapasowy Pracownik (Backup / Rezerwa)**")
-        backup_emp = st.selectbox(
-            "Wybierz pracownika zapasowego",
-            options=employees_options_with_empty,
-            format_func=lambda emp: f"[{emp['employee_key']}] {emp['employee_full_name']} ({emp['work_center']})" if emp['employee_key'] else emp['employee_full_name']
-        )
-
-    col_meta1, col_meta2 = st.columns(2)
-    with col_meta1:
-        valid_from = st.date_input("Obowiązuje od dnia", date.today())
-    with col_meta2:
-        shift = st.selectbox("Zmiana", ["Wszystkie zmiany", "Zmiana I (Rano)", "Zmiana II (Popołudnie)", "Zmiana III (Noc)"])
-
-    remarks = st.text_area("Uwagi do przypisania (np. powód zastępstwa, wymagane uprawnienia)")
-
-    submit_button = st.form_submit_button("Zapisz przypisanie")
-
-# --- LOGIKA ZAPISU DO DATABRICKS VOLUME ---
-if submit_button:
-    if not selected_line_code or not selected_cell_code:
-        st.error("❌ Wybierz prawidłową Linię oraz Komórkę Produkcyjną!")
-    elif default_emp and backup_emp and default_emp["employee_key"] == backup_emp["employee_key"]:
-        st.warning("⚠️ Pracownik domyślny i zapasowy nie mogą być tą samą osobą!")
+        selected_line_code = selected_line_obj["line_code"]
+        selected_line_name = selected_line_obj["line_name"]
     else:
-        line_name_val = df_structure[df_structure['line_code'] == selected_line_code]['line_name'].iloc[0] if not df_structure.empty else ""
-        cell_name_val = df_structure[df_structure['cell_code'] == selected_cell_code]['cell_name'].iloc[0] if not df_structure.empty else ""
+        st.warning("No production lines available in dim_production_cells.")
+        selected_line_code = None
+        selected_line_name = ""
 
-        assignment_payload = {
-            "line_code": selected_line_code,
-            "line_name": line_name_val,
-            "cell_code": selected_cell_code,
-            "cell_name": cell_name_val,
-            "default_employee_key": default_emp["employee_key"] if default_emp else None,
-            "default_employee_name": default_emp["employee_full_name"] if default_emp else None,
-            "backup_employee_key": backup_emp["employee_key"] if backup_emp else None,
-            "backup_employee_name": backup_emp["employee_full_name"] if backup_emp else None,
-            "valid_from": valid_from.isoformat(),
-            "shift": shift,
-            "remarks": remarks,
-            "ingested_at": datetime.now().isoformat(),
-            "source": "streamlit_assignments_app"
-        }
+    st.markdown("##### Global Settings")
+    target_shift = st.selectbox("Target Shift", ["All Shifts", "Shift 1", "Shift 2", "Shift 3"])
+    effective_date = st.date_input("Effective From Date", date.today())
+    general_remarks = st.text_input("Operational Remarks", placeholder="e.g. Q3 Rotation / Reassignment")
 
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        filename = f"assign_{selected_line_code}_{selected_cell_code}_{timestamp_str}.json"
+# ==========================================
+# 2. DETAIL: TREE VIEW & BATCH ASSIGNMENT EDITOR
+# ==========================================
+with col_detail:
+    if selected_line_code:
+        st.subheader(f"2. Line Staffing Overview: {selected_line_code}")
+        st.caption(f"Line Description: {selected_line_name}")
 
-        try:
-            full_cloud_path = f"/Volumes/{CATALOG}/{SCHEMA_BRONZE}/{VOLUME}/{filename}"
-            json_bytes = json.dumps(assignment_payload, ensure_ascii=False, indent=4).encode('utf-8')
+        # Filter cells and existing assignments for this line
+        line_cells = df_structure[df_structure["line_code"] == selected_line_code].copy()
+        
+        # Merge with current assignments for visual tree
+        merged_view = pd.merge(
+            line_cells,
+            df_current_assignments[df_current_assignments["line_code"] == selected_line_code],
+            on=["line_code", "cell_code"],
+            how="left"
+        )
 
-            # Bezkosztowy upload do Volume API
-            w.files.upload(full_cloud_path, json_bytes)
+        # --- TREE VIEW EXPANDER ---
+        with st.expander("Live Staffing Hierarchy Tree", expanded=True):
+            st.markdown(f"**Line `{selected_line_code}`** ({selected_line_name})")
+            
+            vacant_count = 0
+            if not merged_view.empty:
+                for _, row in merged_view.iterrows():
+                    c_code = row["cell_code"]
+                    c_name = row["cell_name"] if pd.notna(row["cell_name"]) else ""
+                    def_emp = row["default_employee_name"] if pd.notna(row["default_employee_name"]) and row["default_employee_name"] else None
+                    back_emp = row["backup_employee_name"] if pd.notna(row["backup_employee_name"]) and row["backup_employee_name"] else None
+                    
+                    if def_emp and back_emp:
+                        status_badge = f"🟢 **`{c_code}`** ({c_name}) &rarr; Primary: **{def_emp}** | Backup: {back_emp}"
+                    elif def_emp:
+                        status_badge = f"🟡 **`{c_code}`** ({c_name}) &rarr; Primary: **{def_emp}** | *No Backup*"
+                    else:
+                        status_badge = f"🔴 **`{c_code}`** ({c_name}) &rarr; **VACANT (No assignment)**"
+                        vacant_count += 1
+                        
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;└── {status_badge}")
+            else:
+                st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;└── *(No cells found for this line)*")
+                
+            if vacant_count > 0:
+                st.caption(f"⚠️ {vacant_count} station(s) currently unassigned on this line.")
 
-            st.success(f"✅ Przypisano obsadę dla komórki `{selected_cell_code}`! Plik `{filename}` wysłany do Databricks.")
-            st.balloons()
-        except Exception as e:
-            st.error(f"❌ Błąd zapisu do Databricks Volume: {e}")
+        st.markdown("##### Batch Staffing Grid")
+        st.caption("Update operators for each cell below and click save to apply assignments.")
+
+        # Prepare initial data for the editor
+        editor_prep = []
+        for _, cell_row in line_cells.iterrows():
+            c_code = cell_row["cell_code"]
+            c_name = cell_row["cell_name"] if pd.notna(cell_row["cell_name"]) else ""
+            
+            # Find existing assignment if present
+            existing = df_current_assignments[
+                (df_current_assignments["line_code"] == selected_line_code) & 
+                (df_current_assignments["cell_code"] == c_code)
+            ]
+            
+            curr_def = existing["default_employee_name"].iloc[0] if not existing.empty and pd.notna(existing["default_employee_name"].iloc[0]) else NONE_OPTION
+            curr_back = existing["backup_employee_name"].iloc[0] if not existing.empty and pd.notna(existing["backup_employee_name"].iloc[0]) else NONE_OPTION
+            
+            if curr_def not in employee_options_list:
+                curr_def = NONE_OPTION
+            if curr_back not in employee_options_list:
+                curr_back = NONE_OPTION
+
+            editor_prep.append({
+                "cell_code": c_code,
+                "cell_name": c_name,
+                "default_operator": curr_def,
+                "backup_operator": curr_back
+            })
+
+        df_editor_input = pd.DataFrame(editor_prep)
+
+        edited_assignments = st.data_editor(
+            df_editor_input,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "cell_code": st.column_config.TextColumn("Cell Code", disabled=True),
+                "cell_name": st.column_config.TextColumn("Cell Name", disabled=True),
+                "default_operator": st.column_config.SelectboxColumn(
+                    "Primary Operator",
+                    options=employee_options_list,
+                    required=True
+                ),
+                "backup_operator": st.column_config.SelectboxColumn(
+                    "Backup Operator",
+                    options=employee_options_list,
+                    required=False
+                )
+            },
+            key="staffing_batch_editor"
+        )
+
+        if st.button(f"Save All Assignments for Line {selected_line_code}"):
+            saved_count = 0
+            validation_error = False
+
+            for _, row in edited_assignments.iterrows():
+                c_code = row["cell_code"]
+                c_name = row["cell_name"]
+                def_op = row["default_operator"]
+                back_op = row["backup_operator"]
+
+                if def_op != NONE_OPTION and back_op != NONE_OPTION and def_op == back_op:
+                    st.warning(f"Cell {c_code}: Primary and Backup operator cannot be the same person.")
+                    validation_error = True
+                    break
+
+            if not validation_error:
+                for _, row in edited_assignments.iterrows():
+                    c_code = row["cell_code"]
+                    c_name = row["cell_name"]
+                    def_op = row["default_operator"]
+                    back_op = row["backup_operator"]
+
+                    # Skip cells left completely unassigned
+                    if def_op == NONE_OPTION and back_op == NONE_OPTION:
+                        continue
+
+                    def_key = int(employee_name_to_key[def_op]) if def_op in employee_name_to_key else None
+                    back_key = int(employee_name_to_key[back_op]) if back_op in employee_name_to_key else None
+
+                    assignment_payload = {
+                        "line_code": selected_line_code,
+                        "line_name": selected_line_name,
+                        "cell_code": c_code,
+                        "cell_name": c_name,
+                        "default_employee_key": def_key,
+                        "default_employee_name": def_op if def_op != NONE_OPTION else None,
+                        "backup_employee_key": back_key,
+                        "backup_employee_name": back_op if back_op != NONE_OPTION else None,
+                        "valid_from": effective_date.isoformat(),
+                        "shift": target_shift,
+                        "remarks": general_remarks.strip() if general_remarks else None,
+                        "ingested_at": datetime.now().isoformat(),
+                        "source": "streamlit_assignments_tree_editor"
+                    }
+
+                    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                    filename = f"assign_{selected_line_code}_{c_code}_{timestamp_str}.json"
+                    full_cloud_path = f"/Volumes/{CATALOG}/{SCHEMA_BRONZE}/{VOLUME}/{filename}"
+                    json_bytes = json.dumps(assignment_payload, ensure_ascii=False, indent=4).encode('utf-8')
+
+                    w.files.upload(full_cloud_path, json_bytes)
+                    saved_count += 1
+
+                st.success(f"Successfully deployed assignments for {saved_count} cell(s) on line {selected_line_code}.")
+                fetch_current_assignments.clear()
+                st.rerun()
+
+    else:
+        st.info("Select a production line on the left to inspect and configure its staffing tree.")
 
 st.divider()
 
-# --- PODGLĄD W VOLUME ---
-with st.expander("📁 Ostatnie pliki przypisań w Volume"):
-    if st.button("Pokaż ostatnie pliki"):
-        try:
-            cloud_dir_path = f"/Volumes/{CATALOG}/{SCHEMA_BRONZE}/{VOLUME}"
-            files_list = w.files.list_directory_contents(cloud_dir_path)
-            files = sorted([f.name for f in files_list], reverse=True)[:5]
-            st.write(files)
-        except Exception as e:
-            st.warning(f"Nie można załadować listy plików: {e}")
+# --- REFRESH CACHE ---
+col_refresh, _ = st.columns([1, 4])
+with col_refresh:
+    if st.button("Refresh Cache & View"):
+        fetch_production_structure.clear()
+        fetch_active_employees.clear()
+        fetch_current_assignments.clear()
+        st.rerun()

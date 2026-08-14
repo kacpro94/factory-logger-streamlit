@@ -1,5 +1,5 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import json
 from datetime import datetime, date
 from databricks.sdk import WorkspaceClient
@@ -7,11 +7,11 @@ from databricks.sdk import WorkspaceClient
 # --- CONFIG DATA PLATFORM ---
 CATALOG = "data_warehouse_factory"
 SCHEMA_BRONZE = "bronze"
-SCHEMA_SILVER = "silver"
+SCHEMA_GOLD = "gold"
 VOLUME = "employees_raw"
-DATABRICKS_WAREHOUSE_ID = "f38fec74b09fdb89" 
+DATABRICKS_WAREHOUSE_ID = "f38fec74b09fdb89"
 
-st.title("👥 Zarządzanie Pracownikami")
+st.title("Employee Management")
 
 # --- REUSABLE CLIENT ---
 @st.cache_resource
@@ -20,14 +20,20 @@ def get_databricks_client():
 
 w = get_databricks_client()
 
-# --- FUNKCJA Z KESZOWANIEM ZAPYTANIA SQL (ZMNIEJSZA ZUŻYCIE COMPUTE) ---
-@st.cache_data(ttl=300)  # Kesz na 5 minut (300 sek)
-def fetch_employees_from_sql():
+# --- 1. FETCH EMPLOYEES FROM GOLD DIMENSION ---
+@st.cache_data(ttl=300)
+def fetch_employees_from_gold():
     try:
-        # Pobieramy tylko potrzebne kolumny biznesowe zamiast SELECT *
         sql_query = f"""
-            SELECT employee_key, employee_full_name, work_center, date_of_employment, date_of_leaving 
-            FROM {CATALOG}.{SCHEMA_SILVER}.silver_employees 
+            SELECT 
+                employee_key, 
+                employee_full_name, 
+                work_center, 
+                date_of_employment, 
+                date_of_leaving,
+                is_active,
+                tenure_months
+            FROM {CATALOG}.{SCHEMA_GOLD}.dim_employees 
             ORDER BY employee_key DESC
         """
         response = w.statement_execution.execute_statement(
@@ -40,57 +46,99 @@ def fetch_employees_from_sql():
             return pd.DataFrame(response.result.data_array, columns=columns)
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Nie udało się pobrać danych z tabeli SQL: {e}")
+        st.error(f"Failed to load employees: {e}")
         return pd.DataFrame()
 
-# --- SEKCJA: WYŚWIETLANIE LISTY PRACOWNIKÓW ---
-st.subheader("📋 Lista pracowników (Databricks Silver)")
+# --- 2. FETCH WORK CENTERS FROM PRODUCTION CELLS ---
+@st.cache_data(ttl=600)
+def get_available_work_centers():
+    try:
+        sql_query = f"""
+            SELECT DISTINCT upper(trim(line_name)) AS work_center 
+            FROM {CATALOG}.{SCHEMA_GOLD}.dim_production_cells 
+            WHERE line_name IS NOT NULL AND trim(line_name) != ''
+            ORDER BY work_center ASC
+        """
+        response = w.statement_execution.execute_statement(
+            warehouse_id=DATABRICKS_WAREHOUSE_ID,
+            statement=sql_query
+        )
+        if response.result and response.result.data_array:
+            return [row[0] for row in response.result.data_array]
+        return ["Assembly", "Manufacturing", "Logistics", "Maintenance"]
+    except Exception:
+        return ["Assembly", "Manufacturing", "Logistics", "Maintenance"]
 
-col_refresh, _ = st.columns([1, 4])
+# --- EMPLOYEES OVERVIEW ---
+st.subheader("Employee Directory")
+
+col_refresh, col_filter, _ = st.columns([1, 2, 3])
 with col_refresh:
-    # Manualne czyszczenie cache i ponowne pobranie danych
-    if st.button("🔄 Odśwież listę"):
-        fetch_employees_from_sql.clear()
+    if st.button("Refresh List"):
+        fetch_employees_from_gold.clear()
         st.rerun()
 
-df_employees = fetch_employees_from_sql()
+df_employees = fetch_employees_from_gold()
+work_center_options = get_available_work_centers()
+
+with col_filter:
+    filter_active = st.checkbox("Show active employees only", value=True)
 
 if not df_employees.empty:
-    st.dataframe(df_employees, use_container_width=True)
+    if filter_active and "is_active" in df_employees.columns:
+        # Obsługuje zarówno wartości bool (True), jak i stringi ("true", "True", "1")
+        is_active_mask = df_employees["is_active"].astype(str).str.lower().isin(["true", "1"])
+        display_df = df_employees[is_active_mask]
+    else:
+        display_df = df_employees
+        
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 else:
-    st.info("Brak danych do wyświetlenia lub tabela jest pusta.")
+    st.info("No employee records found.")
 
 st.divider()
 
-# --- SEKCJA: FORMULARZ DANYCH ---
-st.subheader("➕ Dodaj nowego pracownika")
+# --- ADD EMPLOYEE SECTION ---
+st.subheader("Add New Employee")
 
-with st.form("employee_form", clear_on_submit=True):
-    employee_full_name = st.text_input("Imię i Nazwisko (Employee)")
-    work_center = st.selectbox("Work Center", ["Assembly", "Manufacturing", "Logistics", "Maintenance"])
-    date_of_employment = st.date_input("Date of employment", date.today())
-    
-    # 2. Dynamiczne wywoływanie kontrolek (checkbox + date_input)
-    # Reaguje dynamicznie wewnątrz formularza, jeśli użyjemy pojedynczego kontenera / kolumny
-    has_left = st.checkbox("Pracownik zakończył zatrudnienie")
-    
-    # Do wybrania daty używamy widżetu, który aktywuje się tylko przy zaznaczonym checkboxie
-    date_of_leaving = None
+col_status1, col_status2 = st.columns(2)
+
+with col_status1:
+    has_left = st.checkbox("Employment terminated")
+
+with col_status2:
     if has_left:
-        date_of_leaving = st.date_input("Date of leaving", date.today())
+        selected_leaving_date = st.date_input("Date of leaving", date.today())
+    else:
+        selected_leaving_date = None
 
-    submit_button = st.form_submit_button("Zapisz pracownika")
+# --- FORM ---
+with st.form("employee_form", clear_on_submit=True):
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        employee_full_name = st.text_input("Full Name")
+        work_center = st.selectbox("Work Center", work_center_options)
+        
+    with col2:
+        date_of_employment = st.date_input("Date of employment", date.today())
+        if has_left and selected_leaving_date:
+            st.caption(f"Termination date: {selected_leaving_date.strftime('%Y-%m-%d')}")
 
-# --- LOGIKA ZAPISU (UPLOAD DO VOLUME JEST DARMOWY / BEZ COMPUTE DBU) ---
+    submit_button = st.form_submit_button("Save Employee")
+
+# --- SAVE LOGIC ---
 if submit_button:
     if not employee_full_name.strip():
-        st.warning("⚠️ Pole Imię i Nazwisko nie może być puste!")
+        st.warning("Full Name field cannot be empty.")
+    elif has_left and selected_leaving_date and selected_leaving_date < date_of_employment:
+        st.error("Date of leaving cannot be earlier than Date of employment.")
     else:
         entry_data = {
             "employee_full_name": employee_full_name.strip(),
             "work_center": work_center,
             "date_of_employment": date_of_employment.isoformat(),
-            "date_of_leaving": date_of_leaving.isoformat() if date_of_leaving else None,
+            "date_of_leaving": selected_leaving_date.isoformat() if has_left and selected_leaving_date else None,
             "ingested_at": datetime.now().isoformat(),
             "source": "streamlit_app"
         }
@@ -102,27 +150,24 @@ if submit_button:
             full_cloud_path = f"/Volumes/{CATALOG}/{SCHEMA_BRONZE}/{VOLUME}/{filename}"
             json_bytes = json.dumps(entry_data, ensure_ascii=False, indent=4).encode('utf-8')
 
-            # Wysyłka pliku przez Files API nie zużywa DBU SQL Warehouse!
             w.files.upload(full_cloud_path, json_bytes)
             
-            st.success(f"✅ Dodano pracownika {employee_full_name}! Plik {filename} zapisany w Volume.")
-            st.balloons()
+            st.success(f"Employee {employee_full_name} saved successfully as {filename}.")
             
-            # Unieważniamy cache po dodaniu nowego pracownika
-            fetch_employees_from_sql.clear()
+            fetch_employees_from_gold.clear()
             
         except Exception as e:
-            st.error(f"❌ Błąd zapisu pliku: {str(e)}")
+            st.error(f"Error saving record: {str(e)}")
 
 st.divider()
 
-# --- PODGLĄD PLIKÓW W VOLUME (OPCJONALNY, W EXPANDERZE) ---
-with st.expander("📁 Podgląd ostatnich plików w Volume"):
-    if st.button("Załaduj listę plików"):
+# --- RECENT FILES ---
+with st.expander("Recent Bronze Volume Files"):
+    if st.button("Load File List"):
         try:
             cloud_dir_path = f"/Volumes/{CATALOG}/{SCHEMA_BRONZE}/{VOLUME}"
             files_list = w.files.list_directory_contents(cloud_dir_path)
             files = sorted([f.name for f in files_list], reverse=True)[:5]
             st.write(files)
         except Exception as e:
-            st.warning(f"Nie można załadować listy plików: {e}")
+            st.warning(f"Unable to load files: {e}")
